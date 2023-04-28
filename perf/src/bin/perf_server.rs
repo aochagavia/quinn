@@ -89,6 +89,8 @@ async fn run(opt: Opt) -> Result<()> {
 
     let mut transport = quinn::TransportConfig::default();
     transport.initial_mtu(opt.initial_mtu);
+    transport.min_mtu(1452);
+    transport.datagram_send_buffer_size(100 * 1024 * 1024);
 
     let mut server_config = if opt.no_protection {
         quinn::ServerConfig::with_crypto(Arc::new(NoProtectionServerConfig::new(Arc::new(crypto))))
@@ -129,6 +131,7 @@ async fn handle(handshake: quinn::Connecting, opt: Arc<Opt>) -> Result<()> {
     tokio::try_join!(
         drive_uni(connection.clone()),
         drive_bi(connection.clone()),
+        drive_datagram(connection.clone()),
         conn_stats(connection, opt)
     )?;
     Ok(())
@@ -179,6 +182,28 @@ async fn handle_bi(send: quinn::SendStream, recv: quinn::RecvStream) -> Result<(
     let bytes = read_req(recv).await?;
     respond(bytes, send).await?;
     Ok(())
+}
+
+async fn drive_datagram(connection: quinn::Connection) -> Result<()> {
+    connection.read_datagram().await.ok();
+    let datagram_size = connection.max_datagram_size().unwrap();
+    assert_eq!(datagram_size, 1414);
+
+    // Since all datagrams contain the same data, they can all use the same shared buffer
+    let data = Bytes::from(vec![42; datagram_size]);
+
+    loop {
+        // Make sure the outgoing datagram buffer is always full, so we are sending at the maximum
+        // possible rate allowed by congestion control
+        let space = connection.datagram_send_buffer_space();
+        let mut sent = 0;
+        while sent + datagram_size <= space {
+            sent += datagram_size;
+            connection.send_datagram(data.clone()).context("send_datagram")?;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn read_req(mut stream: quinn::RecvStream) -> Result<u64> {
