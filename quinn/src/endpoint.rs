@@ -140,6 +140,46 @@ impl Endpoint {
         })
     }
 
+    /// Construct an endpoint with arbitrary configuration and pre-constructed abstract socket
+    ///
+    /// Useful when `socket` has additional state (e.g. sidechannels) attached for which shared
+    /// ownership is needed.
+    pub fn new_with_abstract_socket_and_rng_seed(
+        config: EndpointConfig,
+        server_config: Option<ServerConfig>,
+        socket: Arc<dyn AsyncUdpSocket>,
+        runtime: Arc<dyn Runtime>,
+        rng_seed: [u8; 32],
+    ) -> io::Result<Self> {
+        let addr = socket.local_addr()?;
+        let allow_mtud = !socket.may_fragment();
+        let rc = EndpointRef::new(
+            socket,
+            proto::Endpoint::new(
+                Arc::new(config),
+                server_config.map(Arc::new),
+                allow_mtud,
+                Some(rng_seed),
+            ),
+            addr.is_ipv6(),
+            runtime.clone(),
+        );
+        let driver = EndpointDriver(rc.clone());
+        runtime.spawn(Box::pin(
+            async {
+                if let Err(e) = driver.await {
+                    tracing::error!("I/O error: {}", e);
+                }
+            }
+                .instrument(Span::current()),
+        ));
+        Ok(Self {
+            inner: rc,
+            default_client_config: None,
+            runtime,
+        })
+    }
+
     /// Get the next incoming connection attempt from a client
     ///
     /// Yields [`Incoming`]s, or `None` if the endpoint is [`close`](Self::close)d. [`Incoming`]
